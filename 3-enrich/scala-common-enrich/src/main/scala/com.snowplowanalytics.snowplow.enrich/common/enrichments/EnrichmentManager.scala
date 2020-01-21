@@ -17,6 +17,7 @@ import scala.util.matching.Regex
 
 import java.nio.charset.Charset
 import java.net.URI
+import java.time.Instant
 
 import cats.Monad
 import cats.data.{EitherT, NonEmptyList, OptionT, Validated, ValidatedNel}
@@ -45,8 +46,9 @@ import enrichments.registry.pii.PiiPseudonymizerEnrichment
 import enrichments.registry.sqlquery.SqlQueryEnrichment
 import enrichments.web.{PageEnrichments => WPE}
 import outputs.EnrichedEvent
-import utils.{Shredder, ConversionUtils => CU, JsonUtils => JU}
+import utils.{IgluUtils, ConversionUtils => CU, JsonUtils => JU}
 import utils.MapTransformer._
+import com.snowplowanalytics.snowplow.badrows._
 
 /**
  * A module to hold our enrichment process.
@@ -72,233 +74,288 @@ object EnrichmentManager {
     processor: Processor,
     etlTstamp: DateTime,
     raw: RawEvent
-  ): F[Validated[
-    (NonEmptyList[FailureDetails.EnrichmentStageIssue], Payload.PartiallyEnrichedEvent),
-    EnrichedEvent
-  ]] = {
-    // 1. Enrichments not expected to fail
+  ): F[Validated[BadRow, EnrichedEvent]] = {
+
+    ///////////////////////////
+    // 1. Create enriched event
+    ///////////////////////////
 
     // Let's start populating the CanonicalOutput
     // with the fields which cannot error
     val event = setupEnrichedEvent(raw, etlTstamp, processor)
 
-    // 2. Enrichments which can fail
-
-    // 2a. Failable enrichments which don't need the payload
-
-    // Validate that the collectorTstamp exists and is Redshift-compatible
-    val collectorTstamp: Either[FailureDetails.EnrichmentStageIssue, Unit] =
-      setCollectorTstamp(event, raw.context.timestamp)
-
-    // Attempt to decode the useragent
-    // May be updated later if we have a `ua` parameter
-    val useragent: Either[FailureDetails.EnrichmentStageIssue, Unit] =
-      setUseragent(event, raw.context.useragent, raw.source.encoding)
-
-    // 2b. Failable enrichments using the payload
+    // Map/decode the fields of the input event to the enriched event
     val sourceMap: SourceMap = raw.parameters
     val firstPassTransform = event.transform(sourceMap, firstPassTransformMap)
     val secondPassTransform = event.transform(sourceMap, secondPassTransformMap)
 
-    // The load fails if the collector version is not set
-    val collectorVersionSet: Either[FailureDetails.EnrichmentStageIssue, Unit] =
-      getCollectorVersionSet(event)
-
-    // Potentially update the page_url and set the page URL components
-    val pageUri: Either[FailureDetails.EnrichmentStageIssue, Option[URI]] =
-      getPageUri(raw.context.refererUri, event)
-
-    // Calculate the derived timestamp
-    val derivedTstamp: Either[FailureDetails.EnrichmentStageIssue, Unit] = getDerivedTstamp(event)
-
-    // Fetch IAB enrichment context (before anonymizing the IP address)
-    val iabContext: Either[NonEmptyList[FailureDetails.EnrichmentStageIssue], Option[
-      SelfDescribingData[Json]
-    ]] =
-      getIabContext(event, registry.iab)
-
-    // Parse the useragent using user-agent-utils
-    val uaUtils: Either[FailureDetails.EnrichmentStageIssue, Unit] =
-      getUaUtils(event, registry.userAgentUtils)
-
-    // Create the ua_parser_context
-    val uaParser: Either[FailureDetails.EnrichmentStageIssue, Option[SelfDescribingData[Json]]] =
-      getUaParser(event, registry.uaParser)
-
-    // Finalize the currency conversion
-    val currency: F[Either[NonEmptyList[FailureDetails.EnrichmentStageIssue], Unit]] =
-      getCurrency(event, raw.context.timestamp, registry.currencyConversion)
-
-    // Potentially set the referrer details and URL components
-    val refererUri: Either[FailureDetails.EnrichmentStageIssue, Option[URI]] =
-      getRefererUri(event, registry.refererParser)
-
-    // Parse the page URI's querystring
-    val pageQsMap: Either[FailureDetails.EnrichmentStageIssue, Option[Map[String, String]]] =
-      extractQueryString(pageUri, raw.source.encoding)
-
-    // Marketing attribution
-    setCampaign(event, pageQsMap, registry.campaignAttribution)
-
-    // Cross-domain tracking
-    val crossDomain: Either[FailureDetails.EnrichmentStageIssue, Unit] =
-      getCrossDomain(event, pageQsMap)
-
-    // This enrichment cannot fail
-    setEventFingerprint(event, sourceMap, registry.eventFingerprint)
-
-    // Extract the event vendor/name/format/version
-    val extractSchema: F[Either[FailureDetails.EnrichmentStageIssue, Unit]] =
-      extractSchemaFields(event, client)
-
-    // Execute cookie extractor enrichment
-    val cookieExtractorContexts: List[SelfDescribingData[Json]] =
-      headerContexts[CookieExtractorEnrichment](
-        raw.context.headers,
-        registry.cookieExtractor,
-        (e, hs) => e.extract(hs)
-      )
-
-    // Execute header extractor enrichment
-    val httpHeaderExtractorContexts: List[SelfDescribingData[Json]] =
-      headerContexts[HttpHeaderExtractorEnrichment](
-        raw.context.headers,
-        registry.httpHeaderExtractor,
-        (e, hs) => e.extract(hs)
-      )
-
-    // Fetch weather context
-    val weatherContext: F[
-      Either[NonEmptyList[FailureDetails.EnrichmentStageIssue], Option[SelfDescribingData[Json]]]
-    ] =
-      getWeatherContext(event, registry.weather)
-
-    val yauaaContext: Option[SelfDescribingData[Json]] =
-      getYauaaContext(event, registry.yauaa)
-
-    // Validate custom contexts
-    val customContexts
-      : F[ValidatedNel[FailureDetails.EnrichmentStageIssue, List[SelfDescribingData[Json]]]] =
-      Shredder.extractAndValidateCustomContexts(event, client).map(_.toValidatedNel)
-
-    // Validate unstructured event
-    val unstructEvent
-      : F[ValidatedNel[FailureDetails.EnrichmentStageIssue, Option[SelfDescribingData[Json]]]] =
-      Shredder.extractAndValidateUnstructEvent(event, client).map(_.toValidatedNel)
-
-    // Execute IP lookup enrichment
-    val geoloc = geoLocation(event, registry.ipLookups)
-
-    // Execute the JavaScript scripting enrichment
-    val jsScript: Either[FailureDetails.EnrichmentStageIssue, List[SelfDescribingData[Json]]] =
-      getJsScript(event, registry.javascriptScript)
-
-    // Assemble array of contexts prepared by built-in enrichments
-    val preparedDerivedContexts: F[List[SelfDescribingData[Json]]] =
+    val transform = EitherT(
       for {
-        w <- weatherContext
-        res = List(uaParser).collect {
-          case Right(Some(context)) => context
-        } ++ List(w).collect {
-          case Right(Some(context)) => context
-        } ++ List(iabContext).collect {
-          case Right(Some(context)) => context
-        } ++ jsScript.getOrElse(Nil) ++
-          cookieExtractorContexts ++
-          httpHeaderExtractorContexts ++
-          yauaaContext
-      } yield res
-
-    // Derive some contexts with custom SQL Query enrichment
-    val sqlQueryContexts: F[EnrichContextsComplex] =
-      getSqlQueryContexts(
-        event,
-        preparedDerivedContexts,
-        customContexts,
-        unstructEvent,
-        registry.sqlQuery
-      )
-
-    // Derive some contexts with custom API Request enrichment
-    val apiRequestContexts: F[EnrichContextsComplex] =
-      getApiRequestContexts(
-        event,
-        preparedDerivedContexts,
-        customContexts,
-        unstructEvent,
-        registry.apiRequest
-      )
-
-    // Assemble prepared derived contexts with fetched via API Request
-    val derivedContexts: F[List[SelfDescribingData[Json]]] =
-      for {
-        api <- apiRequestContexts
-        sql <- sqlQueryContexts
-        prepDerivedContexts <- preparedDerivedContexts
-      } yield api.getOrElse(Nil) ++ sql.getOrElse(Nil) ++ prepDerivedContexts
-
-    val formatDerivedContexts: F[Unit] = derivedContexts.map {
-      case Nil =>
-        ()
-      case contexts =>
-        event.derived_contexts = ME.formatDerivedContexts(contexts)
-    }
-
-    // Collect our errors on Failure, or return our event on Success
-    val result = (
-      customContexts,
-      unstructEvent,
-      apiRequestContexts,
-      sqlQueryContexts,
-      extractSchema,
-      currency,
-      geoloc,
-      weatherContext,
-      formatDerivedContexts
-    ).mapN { (cc, ue, api, sql, es, cu, geo, w, _) =>
-      (
-        useragent.toValidatedNel,
-        collectorTstamp.toValidatedNel,
-        derivedTstamp.toValidatedNel,
-        uaUtils.toValidatedNel,
-        uaParser.toValidatedNel,
-        collectorVersionSet.toValidatedNel,
-        pageUri.toValidatedNel,
-        crossDomain.toValidatedNel,
-        geo.validNel,
-        refererUri.toValidatedNel,
-        firstPassTransform,
-        cu.toValidated,
-        secondPassTransform,
-        pageQsMap.toValidatedNel,
-        jsScript.toValidatedNel,
-        cc,
-        ue,
-        api,
-        sql,
-        es.toValidatedNel,
-        w.toValidated,
-        iabContext.toValidated
-      ).mapN((_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _) => event)
-        .leftMap(nel => (nel, EnrichedEvent.toPartiallyEnrichedEvent(event)))
-    }
-
-    // Destructive enrichments
-
-    anonIp(event, registry.anonIp).foreach(event.user_ipaddress = _)
-
-    result.map {
-      case Validated.Valid(ev) =>
-        piiTransform(event, registry.piiPseudonymizer) match {
-          case Some(pii) =>
-            ev.pii = pii.asString
-            ev.valid
-          case None =>
-            ev.valid
+        first <- Monad[F].pure(firstPassTransform)
+        second <- Monad[F].pure(secondPassTransform)
+      } yield (first, second)
+        .mapN { (_, _) =>
+          ()
         }
-      case Validated.Invalid(error) =>
-        error.invalid[EnrichedEvent]
-    }
+        .leftMap { enrichmentFailures =>
+          buildEnrichmentFailuresBadRow(
+            enrichmentFailures,
+            EnrichedEvent.toPartiallyEnrichedEvent(event),
+            RawEvent.toRawEvent(raw),
+            processor
+          )
+        }
+        .toEither
+    )
+
+    (for {
+      _ <- transform
+
+      //////////////////////////////////////////////////////////////
+      // 2. Check if input contexts and unstructured event are valid
+      //////////////////////////////////////////////////////////////
+
+      inputSDJs <- EitherT(
+        for {
+          contexts <- IgluUtils.extractAndValidateInputContexts(event, client)
+          unstruct <- IgluUtils.extractAndValidateUnstructEvent(event, client).map(_.toValidatedNel)
+        } yield (contexts, unstruct)
+          .mapN { (c, ue) =>
+            (c, ue)
+          }
+          .leftMap { schemaViolations =>
+            buildSchemaViolationsBadRow(
+              schemaViolations,
+              EnrichedEvent.toPartiallyEnrichedEvent(event),
+              RawEvent.toRawEvent(raw),
+              processor
+            )
+          }
+          .toEither
+      )
+
+      ////////////////////////////////////////////////////////
+      // 3. Run enrichments and check that they are successful
+      ////////////////////////////////////////////////////////
+
+      enrichmentsContexts <- EitherT {
+        val inputContexts = inputSDJs._1
+        val unstructEvent = inputSDJs._2
+
+        // 3a. Enrichments which don't need the payload
+
+        // Validate that the collectorTstamp exists and is Redshift-compatible
+        val collectorTstamp: Either[FailureDetails.EnrichmentFailure, Unit] =
+          setCollectorTstamp(event, raw.context.timestamp)
+
+        // Attempt to decode the useragent
+        // May be updated later if we have a `ua` parameter
+        val useragent: Either[FailureDetails.EnrichmentFailure, Unit] =
+          setUseragent(event, raw.context.useragent, raw.source.encoding)
+
+        // 3b. Enrichments using the payload
+
+        // The load fails if the collector version is not set
+        val collectorVersionSet: Either[FailureDetails.EnrichmentFailure, Unit] =
+          getCollectorVersionSet(event)
+
+        // Potentially update the page_url and set the page URL components
+        val pageUri: Either[FailureDetails.EnrichmentFailure, Option[URI]] =
+          getPageUri(raw.context.refererUri, event)
+
+        // Calculate the derived timestamp
+        val derivedTstamp: Either[FailureDetails.EnrichmentFailure, Unit] = getDerivedTstamp(event)
+
+        // Fetch IAB enrichment context (before anonymizing the IP address)
+        val iabContext: Either[NonEmptyList[FailureDetails.EnrichmentFailure], Option[
+          SelfDescribingData[Json]
+        ]] =
+          getIabContext(event, registry.iab)
+
+        // Parse the useragent using user-agent-utils
+        val uaUtils: Either[FailureDetails.EnrichmentFailure, Unit] =
+          getUaUtils(event, registry.userAgentUtils)
+
+        // Create the ua_parser_context
+        val uaParser: Either[FailureDetails.EnrichmentFailure, Option[SelfDescribingData[Json]]] =
+          getUaParser(event, registry.uaParser)
+
+        // Finalize the currency conversion
+        val currency: F[Either[NonEmptyList[FailureDetails.EnrichmentFailure], Unit]] =
+          getCurrency(event, raw.context.timestamp, registry.currencyConversion)
+
+        // Potentially set the referrer details and URL components
+        val refererUri: Either[FailureDetails.EnrichmentFailure, Option[URI]] =
+          getRefererUri(event, registry.refererParser)
+
+        // Parse the page URI's querystring
+        val pageQsMap: Either[FailureDetails.EnrichmentFailure, Option[Map[String, String]]] =
+          extractQueryString(pageUri, raw.source.encoding)
+
+        // Marketing attribution
+        setCampaign(event, pageQsMap, registry.campaignAttribution)
+
+        // Cross-domain tracking
+        val crossDomain: Either[FailureDetails.EnrichmentFailure, Unit] =
+          getCrossDomain(event, pageQsMap)
+
+        // This enrichment cannot fail
+        setEventFingerprint(event, sourceMap, registry.eventFingerprint)
+
+        // Execute cookie extractor enrichment
+        val cookieExtractorContexts: List[SelfDescribingData[Json]] =
+          headerContexts[CookieExtractorEnrichment](
+            raw.context.headers,
+            registry.cookieExtractor,
+            (e, hs) => e.extract(hs)
+          )
+
+        // Execute header extractor enrichment
+        val httpHeaderExtractorContexts: List[SelfDescribingData[Json]] =
+          headerContexts[HttpHeaderExtractorEnrichment](
+            raw.context.headers,
+            registry.httpHeaderExtractor,
+            (e, hs) => e.extract(hs)
+          )
+
+        // Fetch weather context
+        val weatherContext: F[
+          Either[NonEmptyList[FailureDetails.EnrichmentFailure], Option[SelfDescribingData[Json]]]
+        ] =
+          getWeatherContext(event, registry.weather)
+
+        // Runs YAUAA enrichment (gets info thanks to user agent)
+        val yauaaContext: Option[SelfDescribingData[Json]] =
+          getYauaaContext(event, registry.yauaa)
+
+        // Extract the event vendor/name/format/version
+        val extractSchema: Either[FailureDetails.EnrichmentFailure, Unit] =
+          extractSchemaFields(event, unstructEvent)
+
+        // Execute IP lookup enrichment
+        val geoloc = geoLocation(event, registry.ipLookups)
+
+        // Execute the JavaScript scripting enrichment
+        val jsScript: Either[FailureDetails.EnrichmentFailure, List[SelfDescribingData[Json]]] =
+          getJsScript(event, registry.javascriptScript)
+
+        // Enrichments that don't run in a Monad
+        val noMonadEnrichments: ValidatedNel[FailureDetails.EnrichmentFailure, Unit] =
+          (
+            collectorTstamp.toValidatedNel,
+            useragent.toValidatedNel,
+            collectorVersionSet.toValidatedNel,
+            pageUri.toValidatedNel,
+            derivedTstamp.toValidatedNel,
+            iabContext.toValidated,
+            uaUtils.toValidatedNel,
+            uaParser.toValidatedNel,
+            refererUri.toValidatedNel,
+            pageQsMap.toValidatedNel,
+            crossDomain.toValidatedNel,
+            extractSchema.toValidatedNel,
+            jsScript.toValidatedNel
+          ).mapN((_, _, _, _, _, _, _, _, _, _, _, _, _) => ())
+
+        // Contexts of built-in enrichments
+        val builtInContexts: F[List[SelfDescribingData[Json]]] =
+          for {
+            w <- weatherContext
+            res = List(uaParser).collect {
+              case Right(Some(context)) => context
+            } ++ List(iabContext).collect {
+              case Right(Some(context)) => context
+            } ++ List(yauaaContext).collect {
+              case Some(context) => context
+            } ++ jsScript.getOrElse(Nil) ++
+              cookieExtractorContexts ++
+              httpHeaderExtractorContexts
+          } yield res
+
+        // Derive some contexts with custom SQL Query enrichment
+        val sqlQueryContexts
+          : F[ValidatedNel[FailureDetails.EnrichmentFailure, List[SelfDescribingData[Json]]]] =
+          getSqlQueryContexts[F](
+            event,
+            builtInContexts,
+            inputContexts,
+            unstructEvent,
+            registry.sqlQuery
+          )
+
+        // Derive some contexts with custom API Request enrichment
+        val apiRequestContexts
+          : F[ValidatedNel[FailureDetails.EnrichmentFailure, List[SelfDescribingData[Json]]]] =
+          getApiRequestContexts[F](
+            event,
+            builtInContexts,
+            inputContexts,
+            unstructEvent,
+            registry.apiRequest
+          )
+
+        // Merge all enrichments errors if any
+        (
+          currency,
+          weatherContext,
+          geoloc,
+          sqlQueryContexts,
+          apiRequestContexts,
+          builtInContexts
+        ).mapN { (cur, wea, _, sql, api, ctxts) =>
+          (
+            cur.toValidated,
+            wea.toValidated,
+            sql,
+            api,
+            noMonadEnrichments
+          ).mapN { (_, _, sqlContexts, apiContexts, _) =>
+              ctxts ++ sqlContexts ++ apiContexts
+            }
+            .leftMap(
+              enrichmentFailures =>
+                buildEnrichmentFailuresBadRow(
+                  enrichmentFailures,
+                  EnrichedEvent.toPartiallyEnrichedEvent(event),
+                  RawEvent.toRawEvent(raw),
+                  processor
+                )
+            )
+            .toEither
+        }
+      }
+
+      //////////////////////////////////////////////////////////////////////
+      // 5. Check that all the contexts created by the enrichments are valid
+      //////////////////////////////////////////////////////////////////////
+
+      _ <- EitherT(for {
+        valid <- IgluUtils.validateEnrichmentsContexts[F](client, enrichmentsContexts)
+      } yield valid.leftMap { enrichmentFailures =>
+        buildEnrichmentFailuresBadRow(
+          enrichmentFailures,
+          EnrichedEvent.toPartiallyEnrichedEvent(event),
+          RawEvent.toRawEvent(raw),
+          processor
+        )
+      }.toEither)
+
+      ////////////////////////////////////////////////////////////////////////////////////////////////
+      // 6. Add all the enrichments contexts to the enriched event and run the destructive enrichments
+      ////////////////////////////////////////////////////////////////////////////////////////////////
+
+      _ <- EitherT.rightT[F, BadRow] {
+
+        if (enrichmentsContexts.nonEmpty)
+          event.derived_contexts = ME.formatDerivedContexts(enrichmentsContexts)
+
+        anonIp(event, registry.anonIp).foreach(event.user_ipaddress = _)
+
+        piiTransform(event, registry.piiPseudonymizer).foreach { pii =>
+          event.pii = pii.asString
+        }
+      }
+    } yield event).toValidated
   }
 
   def setupEnrichedEvent(
@@ -322,7 +379,7 @@ object EnrichmentManager {
   def setCollectorTstamp(
     event: EnrichedEvent,
     timestamp: Option[DateTime]
-  ): Either[FailureDetails.EnrichmentStageIssue, Unit] =
+  ): Either[FailureDetails.EnrichmentFailure, Unit] =
     EE.formatCollectorTstamp(timestamp).map { t =>
       event.collector_tstamp = t
       ().asRight
@@ -332,7 +389,7 @@ object EnrichmentManager {
     event: EnrichedEvent,
     useragent: Option[String],
     encoding: String
-  ): Either[FailureDetails.EnrichmentStageIssue, Unit] =
+  ): Either[FailureDetails.EnrichmentFailure, Unit] =
     useragent match {
       case Some(ua) =>
         CU.decodeString(Charset.forName(encoding), ua)
@@ -351,9 +408,7 @@ object EnrichmentManager {
     }
 
   // The load fails if the collector version is not set
-  def getCollectorVersionSet(
-    event: EnrichedEvent
-  ): Either[FailureDetails.EnrichmentStageIssue, Unit] =
+  def getCollectorVersionSet(event: EnrichedEvent): Either[FailureDetails.EnrichmentFailure, Unit] =
     event.v_collector match {
       case "" | null =>
         FailureDetails
@@ -413,7 +468,7 @@ object EnrichmentManager {
   def getPageUri(
     refererUri: Option[String],
     event: EnrichedEvent
-  ): Either[FailureDetails.EnrichmentStageIssue, Option[URI]] = {
+  ): Either[FailureDetails.EnrichmentFailure, Option[URI]] = {
     val pageUri = WPE.extractPageUri(refererUri, Option(event.page_url))
     for {
       uri <- pageUri
@@ -435,7 +490,7 @@ object EnrichmentManager {
   }
 
   // Calculate the derived timestamp
-  def getDerivedTstamp(event: EnrichedEvent): Either[FailureDetails.EnrichmentStageIssue, Unit] =
+  def getDerivedTstamp(event: EnrichedEvent): Either[FailureDetails.EnrichmentFailure, Unit] =
     EE.getDerivedTimestamp(
         Option(event.dvce_sent_tstamp),
         Option(event.dvce_created_tstamp),
@@ -453,7 +508,7 @@ object EnrichmentManager {
   def getIabContext(
     event: EnrichedEvent,
     iabEnrichment: Option[IabEnrichment]
-  ): Either[NonEmptyList[FailureDetails.EnrichmentStageIssue], Option[SelfDescribingData[Json]]] =
+  ): Either[NonEmptyList[FailureDetails.EnrichmentFailure], Option[SelfDescribingData[Json]]] =
     iabEnrichment match {
       case Some(iab) =>
         event.user_ipaddress match {
@@ -481,7 +536,7 @@ object EnrichmentManager {
   def getUaUtils(
     event: EnrichedEvent,
     userAgentUtils: Option[UserAgentUtilsEnrichment]
-  ): Either[FailureDetails.EnrichmentStageIssue, Unit] =
+  ): Either[FailureDetails.EnrichmentFailure, Unit] =
     userAgentUtils match {
       case Some(uap) =>
         Option(event.useragent) match {
@@ -508,7 +563,7 @@ object EnrichmentManager {
   def getUaParser(
     event: EnrichedEvent,
     uaParser: Option[UaParserEnrichment]
-  ): Either[FailureDetails.EnrichmentStageIssue, Option[SelfDescribingData[Json]]] =
+  ): Either[FailureDetails.EnrichmentFailure, Option[SelfDescribingData[Json]]] =
     uaParser match {
       case Some(uap) =>
         Option(event.useragent) match {
@@ -522,7 +577,7 @@ object EnrichmentManager {
     event: EnrichedEvent,
     timestamp: Option[DateTime],
     currencyConversion: Option[CurrencyConversionEnrichment[F]]
-  ): F[Either[NonEmptyList[FailureDetails.EnrichmentStageIssue], Unit]] =
+  ): F[Either[NonEmptyList[FailureDetails.EnrichmentFailure], Unit]] =
     currencyConversion match {
       case Some(currency) =>
         event.base_currency = currency.baseCurrency.getCode
@@ -564,7 +619,7 @@ object EnrichmentManager {
   def getRefererUri(
     event: EnrichedEvent,
     refererParser: Option[RefererParserEnrichment]
-  ): Either[FailureDetails.EnrichmentStageIssue, Option[URI]] = {
+  ): Either[FailureDetails.EnrichmentFailure, Option[URI]] = {
     val refererUri = CU.stringToUri(event.page_referrer)
     for {
       uri <- refererUri
@@ -615,9 +670,9 @@ object EnrichmentManager {
 
   // Parse the page URI's querystring
   def extractQueryString(
-    pageUri: Either[FailureDetails.EnrichmentStageIssue, Option[URI]],
+    pageUri: Either[FailureDetails.EnrichmentFailure, Option[URI]],
     encoding: String
-  ): Either[FailureDetails.EnrichmentStageIssue, Option[Map[String, String]]] = pageUri match {
+  ): Either[FailureDetails.EnrichmentFailure, Option[Map[String, String]]] = pageUri match {
     case Right(Some(u)) =>
       CU.extractQuerystring(u, Charset.forName(encoding)).map(_.some)
     case _ => None.asRight
@@ -625,7 +680,7 @@ object EnrichmentManager {
 
   def setCampaign(
     event: EnrichedEvent,
-    pageQsMap: Either[FailureDetails.EnrichmentStageIssue, Option[Map[String, String]]],
+    pageQsMap: Either[FailureDetails.EnrichmentFailure, Option[Map[String, String]]],
     campaignAttribution: Option[CampaignAttributionEnrichment]
   ): Unit = pageQsMap match {
     case Right(Some(qsMap)) =>
@@ -647,8 +702,8 @@ object EnrichmentManager {
 
   def getCrossDomain(
     event: EnrichedEvent,
-    pageQsMap: Either[FailureDetails.EnrichmentStageIssue, Option[Map[String, String]]]
-  ): Either[FailureDetails.EnrichmentStageIssue, Unit] = pageQsMap match {
+    pageQsMap: Either[FailureDetails.EnrichmentFailure, Option[Map[String, String]]]
+  ): Either[FailureDetails.EnrichmentFailure, Unit] = pageQsMap match {
     case Right(Some(qsMap)) =>
       val crossDomainParseResult = WPE.parseCrossDomain(qsMap)
       for ((maybeRefrDomainUserid, maybeRefrDvceTstamp) <- crossDomainParseResult.toOption) {
@@ -670,27 +725,27 @@ object EnrichmentManager {
     }
 
   // Extract the event vendor/name/format/version
-  def extractSchemaFields[F[_]: Monad: RegistryLookup: Clock](
+  def extractSchemaFields(
     event: EnrichedEvent,
-    client: Client[F, Json]
-  ): F[Either[FailureDetails.EnrichmentStageIssue, Unit]] =
+    unstructEvent: Option[SelfDescribingData[Json]]
+  ): Either[FailureDetails.EnrichmentFailure, Unit] =
     SchemaEnrichment
-      .extractSchema(event, client)
+      .extractSchema(event, unstructEvent)
       .map {
-        _.map { schemaKey =>
+        case Some(schemaKey) =>
           event.event_vendor = schemaKey.vendor
           event.event_name = schemaKey.name
           event.event_format = schemaKey.format
           event.event_version = schemaKey.version.asString
-          ().asRight
-        }
+          ()
+        case None => ()
       }
 
   // Execute the JavaScript scripting enrichment
   def getJsScript(
     event: EnrichedEvent,
     javascriptScript: Option[JavascriptScriptEnrichment]
-  ): Either[FailureDetails.EnrichmentStageIssue, List[SelfDescribingData[Json]]] =
+  ): Either[FailureDetails.EnrichmentFailure, List[SelfDescribingData[Json]]] =
     javascriptScript match {
       case Some(jse) => jse.process(event)
       case None => Nil.asRight
@@ -710,7 +765,7 @@ object EnrichmentManager {
     event: EnrichedEvent,
     weather: Option[WeatherEnrichment[F]]
   ): F[
-    Either[NonEmptyList[FailureDetails.EnrichmentStageIssue], Option[SelfDescribingData[Json]]]
+    Either[NonEmptyList[FailureDetails.EnrichmentFailure], Option[SelfDescribingData[Json]]]
   ] =
     weather match {
       case Some(we) =>
@@ -732,61 +787,37 @@ object EnrichmentManager {
   // Derive some contexts with custom SQL Query enrichment
   def getSqlQueryContexts[F[_]: Monad](
     event: EnrichedEvent,
-    preparedDerivedContexts: F[List[SelfDescribingData[Json]]],
-    customContexts: F[EnrichContextsComplex],
-    unstructEvent: F[
-      ValidatedNel[FailureDetails.EnrichmentStageIssue, Option[SelfDescribingData[Json]]]
-    ],
+    enrichmentsContexts: F[List[SelfDescribingData[Json]]],
+    inputContexts: List[SelfDescribingData[Json]],
+    unstructEvent: Option[SelfDescribingData[Json]],
     sqlQuery: Option[SqlQueryEnrichment[F]]
-  ): F[EnrichContextsComplex] =
+  ): F[ValidatedNel[FailureDetails.EnrichmentFailure, List[SelfDescribingData[Json]]]] =
     sqlQuery match {
       case Some(enrichment) =>
         for {
-          derivedContexts <- preparedDerivedContexts
-          otherContexts <- customContexts.product(unstructEvent)
-          lookupResult <- otherContexts match {
-            case (Validated.Valid(cctx), Validated.Valid(ue)) =>
-              enrichment.lookup(event, derivedContexts, cctx, ue)
-            case _ =>
-              // Skip. Unstruct event or custom context corrupted (event enrichment will fail)
-              List
-                .empty[SelfDescribingData[Json]]
-                .validNel[FailureDetails.EnrichmentStageIssue]
-                .pure[F]
-          }
+          derivedContexts <- enrichmentsContexts
+          lookupResult <- enrichment.lookup(event, derivedContexts, inputContexts, unstructEvent)
         } yield lookupResult
       case None =>
-        List.empty[SelfDescribingData[Json]].validNel[FailureDetails.EnrichmentStageIssue].pure[F]
+        List.empty[SelfDescribingData[Json]].validNel[FailureDetails.EnrichmentFailure].pure[F]
     }
 
   // Derive some contexts with custom API Request enrichment
   def getApiRequestContexts[F[_]: Monad](
     event: EnrichedEvent,
-    preparedDerivedContexts: F[List[SelfDescribingData[Json]]],
-    customContexts: F[EnrichContextsComplex],
-    unstructEvent: F[
-      ValidatedNel[FailureDetails.EnrichmentStageIssue, Option[SelfDescribingData[Json]]]
-    ],
+    enrichmentsContexts: F[List[SelfDescribingData[Json]]],
+    inputContexts: List[SelfDescribingData[Json]],
+    unstructEvent: Option[SelfDescribingData[Json]],
     apiRequest: Option[ApiRequestEnrichment[F]]
-  ): F[EnrichContextsComplex] =
+  ): F[ValidatedNel[FailureDetails.EnrichmentFailure, List[SelfDescribingData[Json]]]] =
     apiRequest match {
       case Some(enrichment) =>
         for {
-          derivedContexts <- preparedDerivedContexts
-          otherContexts <- customContexts.product(unstructEvent)
-          lookupResult <- otherContexts match {
-            case (Validated.Valid(cctx), Validated.Valid(ue)) =>
-              enrichment.lookup(event, derivedContexts, cctx, ue)
-            case _ =>
-              // Skip. Unstruct event or custom context corrupted, event enrichment will fail anyway
-              List
-                .empty[SelfDescribingData[Json]]
-                .validNel[FailureDetails.EnrichmentStageIssue]
-                .pure[F]
-          }
+          derivedContexts <- enrichmentsContexts
+          lookupResult <- enrichment.lookup(event, derivedContexts, inputContexts, unstructEvent)
         } yield lookupResult
       case None =>
-        List.empty[SelfDescribingData[Json]].validNel[FailureDetails.EnrichmentStageIssue].pure[F]
+        List.empty[SelfDescribingData[Json]].validNel[FailureDetails.EnrichmentFailure].pure[F]
     }
 
   def piiTransform(
@@ -887,4 +918,26 @@ object EnrichmentManager {
   private val secondPassTransformMap: TransformMap =
     // Overwrite collector-set nuid with tracker-set tnuid
     Map(("tnuid", (ME.toTsvSafe, "network_userid")))
+
+  def buildEnrichmentFailuresBadRow(
+    fs: NonEmptyList[FailureDetails.EnrichmentFailure],
+    pee: Payload.PartiallyEnrichedEvent,
+    re: Payload.RawEvent,
+    processor: Processor
+  ) = BadRow.EnrichmentFailures(
+    processor,
+    Failure.EnrichmentFailures(Instant.now(), fs),
+    Payload.EnrichmentPayload(pee, re)
+  )
+
+  private def buildSchemaViolationsBadRow(
+    vs: NonEmptyList[FailureDetails.SchemaViolation],
+    pee: Payload.PartiallyEnrichedEvent,
+    re: Payload.RawEvent,
+    processor: Processor
+  ) = BadRow.SchemaViolations(
+    processor,
+    Failure.SchemaViolations(Instant.now(), vs),
+    Payload.EnrichmentPayload(pee, re)
+  )
 }
