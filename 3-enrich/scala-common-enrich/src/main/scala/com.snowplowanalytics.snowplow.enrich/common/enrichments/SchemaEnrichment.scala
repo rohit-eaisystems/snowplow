@@ -56,7 +56,9 @@ object SchemaEnrichment {
         val f = FailureDetails.EnrichmentFailureMessage.InputData(
           "event",
           Option(eventType),
-          "trying to extract the schema of the enriched event but can't recognize the event type"
+          s"""trying to extract the schema of the enriched event but event type [$eventType] doesn't match
+          any of page_view, page_ping, struct, transaction, transaction_item and unstruct
+          """
         )
         Left(FailureDetails.EnrichmentFailure(None, f))
     }

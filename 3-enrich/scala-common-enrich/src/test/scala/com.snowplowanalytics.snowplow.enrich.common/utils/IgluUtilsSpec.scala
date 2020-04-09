@@ -18,17 +18,29 @@ import org.specs2.matcher.ValidatedMatchers
 import com.snowplowanalytics.iglu.core.{SchemaKey, SchemaVer, SelfDescribingData}
 import com.snowplowanalytics.iglu.client.ClientError.{ResolutionError, ValidationError}
 
-import com.snowplowanalytics.snowplow.enrich.common.outputs.EnrichedEvent
-import com.snowplowanalytics.snowplow.enrich.common.SpecHelpers
-import com.snowplowanalytics.snowplow.enrich.common.utils.Clock._
-
 import com.snowplowanalytics.snowplow.badrows._
 
 import io.circe.Json
 
 import cats.data.NonEmptyList
 
+import com.snowplowanalytics.snowplow.enrich.common.outputs.EnrichedEvent
+import com.snowplowanalytics.snowplow.enrich.common.SpecHelpers
+import com.snowplowanalytics.snowplow.enrich.common.utils.Clock._
+import com.snowplowanalytics.snowplow.enrich.common.adapters.RawEvent
+import com.snowplowanalytics.snowplow.enrich.common.loaders.CollectorPayload
+
 class IgluUtilsSpec extends Specification with ValidatedMatchers {
+
+  val raw = RawEvent(
+    CollectorPayload.Api("vendor", "version"),
+    Map.empty[String, String],
+    None,
+    CollectorPayload.Source("source", "enc", None),
+    CollectorPayload.Context(None, None, None, None, Nil, None)
+  )
+  val processor = Processor("unit tests SCE", "v42")
+  val enriched = new EnrichedEvent()
 
   val notJson = "foo"
   val notIglu = """{"foo":"bar"}"""
@@ -131,7 +143,7 @@ class IgluUtilsSpec extends Specification with ValidatedMatchers {
       }
     }
 
-    "return a SchemaViolation.IgluError wrapping a ValidationError if the JSON in .data is not self-describing" >> {
+    "return a SchemaViolation.IgluError containing a ValidationError if the JSON in .data is not self-describing" >> {
       val input = new EnrichedEvent
       input.setUnstruct_event(buildUnstruct(notIglu))
 
@@ -145,7 +157,7 @@ class IgluUtilsSpec extends Specification with ValidatedMatchers {
       }
     }
 
-    "return a SchemaViolation.IgluError wrapping a ValidationError if the JSON in .data is not a valid SDJ" >> {
+    "return a SchemaViolation.IgluError containing a ValidationError if the JSON in .data is not a valid SDJ" >> {
       val input = new EnrichedEvent
       input.setUnstruct_event(buildUnstruct(invalidEmailSent))
 
@@ -159,7 +171,7 @@ class IgluUtilsSpec extends Specification with ValidatedMatchers {
       }
     }
 
-    "return a SchemaViolation.IgluError wrapping a ResolutionError if the schema of the SDJ in .data can't be resolved" >> {
+    "return a SchemaViolation.IgluError containing a ResolutionError if the schema of the SDJ in .data can't be resolved" >> {
       val input = new EnrichedEvent
       input.setUnstruct_event(buildUnstruct(noSchema))
 
@@ -233,7 +245,7 @@ class IgluUtilsSpec extends Specification with ValidatedMatchers {
       }
     }
 
-    "return a SchemaViolation.IgluError wrapping a ValidationError if .data does not contain an array of JSON objects" >> {
+    "return a SchemaViolation.IgluError containing a ValidationError if .data does not contain an array of JSON objects" >> {
       val input = new EnrichedEvent
       val notArrayContexts =
         s"""{"schema": "${inputContextsSchema.toSchemaUri}", "data": ${emailSent1}}"""
@@ -250,7 +262,7 @@ class IgluUtilsSpec extends Specification with ValidatedMatchers {
       }
     }
 
-    "return a SchemaViolation.IgluError wrapping a ValidationError if .data contains one invalid context" >> {
+    "return a SchemaViolation.IgluError containing a ValidationError if .data contains one invalid context" >> {
       val input = new EnrichedEvent
       input.setContexts(buildInputContexts(List(invalidEmailSent)))
 
@@ -265,7 +277,7 @@ class IgluUtilsSpec extends Specification with ValidatedMatchers {
       }
     }
 
-    "return a SchemaViolation.IgluError wrapping a ResolutionError if .data contains one context whose schema can't be resolved" >> {
+    "return a SchemaViolation.IgluError containing a ResolutionError if .data contains one context whose schema can't be resolved" >> {
       val input = new EnrichedEvent
       input.setContexts(buildInputContexts(List(noSchema)))
 
@@ -315,7 +327,9 @@ class IgluUtilsSpec extends Specification with ValidatedMatchers {
       IgluUtils
         .extractAndValidateInputContexts(input, SpecHelpers.client)
         .value must beValid.like {
-        case sdjs: List[SelfDescribingData[Json]] if sdjs.forall(_.schema == emailSentSchema) => ok
+        case sdjs: List[SelfDescribingData[Json]]
+            if sdjs.size == 2 && sdjs.forall(_.schema == emailSentSchema) =>
+          ok
         case res =>
           ko(s"[$res] are not 2 SDJs with expected schema [${emailSentSchema.toSchemaUri}]")
       }
@@ -323,82 +337,91 @@ class IgluUtilsSpec extends Specification with ValidatedMatchers {
   }
 
   "validateEnrichmentsContexts" should {
-    "return an expected failure for one invalid context" >> {
+    "return a BadRow.EnrichmentFailures with one expected failure for one invalid context" >> {
       val contexts = List(
         SpecHelpers.jsonStringToSDJ(invalidEmailSent).right.get
       )
 
       IgluUtils
-        .validateEnrichmentsContexts(SpecHelpers.client, contexts)
-        .value must beInvalid.like {
-        case NonEmptyList(
-            FailureDetails.EnrichmentFailure(
-              _,
-              FailureDetails.EnrichmentFailureMessage.IgluError(_, ValidationError(_))
-            ),
-            Nil
-            ) =>
-          ok
-        case NonEmptyList(
-            FailureDetails
-              .EnrichmentFailure(_, FailureDetails.EnrichmentFailureMessage.IgluError(_, err)),
-            Nil
-            ) =>
-          ko(s"IgluError [$err] is not ValidationError")
-        case err => ko(s"[$err] is not one IgluError")
+        .validateEnrichmentsContexts(SpecHelpers.client, contexts, raw, processor, enriched)
+        .value
+        .value must beLeft.like {
+        case BadRow.EnrichmentFailures(_, failures, _) => {
+          failures.messages match {
+            case NonEmptyList(
+                FailureDetails.EnrichmentFailure(
+                  _,
+                  FailureDetails.EnrichmentFailureMessage.IgluError(_, ValidationError(_))
+                ),
+                _
+                ) =>
+              ok
+            case err => ko(s"bad row is EnrichmentFailures but [$err] is not one ValidationError")
+          }
+        }
+        case br => ko(s"bad row [$br] is not EnrichmentFailures")
       }
     }
 
-    "return 2 expected failures for 2 invalid contexts" >> {
+    "return a BadRow.EnrichmentFailures 2 expected failures for 2 invalid contexts" >> {
       val contexts = List(
         SpecHelpers.jsonStringToSDJ(invalidEmailSent).right.get,
         SpecHelpers.jsonStringToSDJ(noSchema).right.get
       )
 
       IgluUtils
-        .validateEnrichmentsContexts(SpecHelpers.client, contexts)
-        .value must beInvalid.like {
-        case NonEmptyList(
-            FailureDetails.EnrichmentFailure(
-              _,
-              FailureDetails.EnrichmentFailureMessage.IgluError(_, ValidationError(_))
-            ),
-            List(
-              FailureDetails.EnrichmentFailure(
-                _,
-                FailureDetails.EnrichmentFailureMessage.IgluError(_, ResolutionError(_))
+        .validateEnrichmentsContexts(SpecHelpers.client, contexts, raw, processor, enriched)
+        .value
+        .value must beLeft.like {
+        case BadRow.EnrichmentFailures(_, failures, _) => {
+          failures.messages match {
+            case NonEmptyList(
+                FailureDetails.EnrichmentFailure(
+                  _,
+                  FailureDetails.EnrichmentFailureMessage.IgluError(_, ValidationError(_))
+                ),
+                List(
+                  FailureDetails.EnrichmentFailure(
+                    _,
+                    FailureDetails.EnrichmentFailureMessage.IgluError(_, ResolutionError(_))
+                  )
+                )
+                ) =>
+              ok
+            case errs =>
+              ko(
+                s"bad row is EnrichmentFailures but [$errs] is not one ValidationError and one ResolutionError"
               )
-            )
-            ) =>
-          ok
-        case errs => ko(s"[$errs] is not one ValidationError and one ResolutionError")
+          }
+        }
+        case br => ko(s"bad row [$br] is not EnrichmentFailures")
       }
     }
 
-    "return an expected failure for 1 valid context and one invalid" >> {
+    "return a BadRow.EnrichmentFailures with an expected failure for 1 valid context and one invalid" >> {
       val contexts = List(
         SpecHelpers.jsonStringToSDJ(invalidEmailSent).right.get,
         SpecHelpers.jsonStringToSDJ(emailSent1).right.get
       )
 
       IgluUtils
-        .validateEnrichmentsContexts(SpecHelpers.client, contexts)
-        .value must beInvalid.like {
-        case NonEmptyList(
-            FailureDetails.EnrichmentFailure(
-              _,
-              FailureDetails.EnrichmentFailureMessage.IgluError(_, ValidationError(_))
-            ),
-            Nil
-            ) =>
-          ok
-        case NonEmptyList(
-            FailureDetails
-              .EnrichmentFailure(_, FailureDetails.EnrichmentFailureMessage.IgluError(_, err)),
-            Nil
-            ) =>
-          ko(s"IgluError [$err] is not ValidationError")
-        case err => ko(s"failure [$err] is not one IgluError")
+        .validateEnrichmentsContexts(SpecHelpers.client, contexts, raw, processor, enriched)
+        .value
+        .value must beLeft.like {
+        case BadRow.EnrichmentFailures(_, failures, _) => {
+          failures.messages match {
+            case NonEmptyList(
+                FailureDetails.EnrichmentFailure(
+                  _,
+                  FailureDetails.EnrichmentFailureMessage.IgluError(_, ValidationError(_))
+                ),
+                Nil
+                ) =>
+              ok
+            case err => ko(s"bad row is EnrichmentFailures but [$err] is not one ValidationError")
+          }
+        }
+        case br => ko(s"bad row [$br] is not EnrichmentFailures")
       }
     }
 
@@ -409,8 +432,90 @@ class IgluUtilsSpec extends Specification with ValidatedMatchers {
       )
 
       IgluUtils
-        .validateEnrichmentsContexts(SpecHelpers.client, contexts)
-        .value must beValid
+        .validateEnrichmentsContexts(SpecHelpers.client, contexts, raw, processor, enriched)
+        .value
+        .value must beRight
+    }
+  }
+
+  "extractAndValidateInputJsons" should {
+    "return a SchemaViolations containing 1 error if the input event contains an invalid unstructured event" >> {
+      val input = new EnrichedEvent
+      input.setUnstruct_event(buildUnstruct(invalidEmailSent))
+
+      IgluUtils
+        .extractAndValidateInputJsons(
+          input,
+          SpecHelpers.client,
+          raw,
+          processor
+        )
+        .value
+        .value must beLeft.like {
+        case BadRow.SchemaViolations(_, failure, _) if failure.messages.size == 1 => ok
+        case br => ko(s"bad row [$br] is not a SchemaViolations containing 1 error")
+      }
+    }
+
+    "return a SchemaViolations containing 1 error if the input event contains 1 invalid context" >> {
+      val input = new EnrichedEvent
+      input.setContexts(buildInputContexts(List(invalidEmailSent)))
+
+      IgluUtils
+        .extractAndValidateInputJsons(
+          input,
+          SpecHelpers.client,
+          raw,
+          processor
+        )
+        .value
+        .value must beLeft.like {
+        case BadRow.SchemaViolations(_, failure, _) if failure.messages.size == 1 => ok
+        case br => ko(s"bad row [$br] is not a SchemaViolations containing 1 error")
+      }
+    }
+
+    "return a SchemaViolations containing 2 errors if the input event contains an invalid unstructured event and 1 invalid context" >> {
+      val input = new EnrichedEvent
+      input.setUnstruct_event(invalidEmailSent)
+      input.setContexts(buildInputContexts(List(invalidEmailSent)))
+
+      IgluUtils
+        .extractAndValidateInputJsons(
+          input,
+          SpecHelpers.client,
+          raw,
+          processor
+        )
+        .value
+        .value must beLeft.like {
+        case BadRow.SchemaViolations(_, failure, _) if failure.messages.size == 2 => ok
+        case br => ko(s"bad row [$br] is not a SchemaViolations containing 2 errors")
+      }
+    }
+
+    "return the extracted unstructured event and the extracted input contexts if they are all valid" >> {
+      val input = new EnrichedEvent
+      input.setUnstruct_event(buildUnstruct(emailSent1))
+      input.setContexts(buildInputContexts(List(emailSent1, emailSent2)))
+
+      IgluUtils
+        .extractAndValidateInputJsons(
+          input,
+          SpecHelpers.client,
+          raw,
+          processor
+        )
+        .value
+        .value must beRight.like {
+        case (sdjs: List[SelfDescribingData[Json]], Some(sdj))
+            if sdjs.size == 2 && (sdj :: sdjs).forall(_.schema == emailSentSchema) =>
+          ok
+        case (list, opt) =>
+          ko(
+            s"[($list, $opt)] is not a list with 2 extracted contexts and an option with the extracted unstructured event"
+          )
+      }
     }
   }
 

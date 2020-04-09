@@ -14,7 +14,7 @@ package com.snowplowanalytics.snowplow.enrich.common
 package enrichments
 
 import org.specs2.mutable.Specification
-import org.specs2.matcher.ValidatedMatchers
+import org.specs2.matcher.EitherMatchers
 
 import cats.Eval
 import cats.implicits._
@@ -27,7 +27,6 @@ import org.joda.time.DateTime
 import com.snowplowanalytics.snowplow.badrows._
 
 import com.snowplowanalytics.iglu.core.{SchemaKey, SchemaVer}
-import com.snowplowanalytics.iglu.client.ClientError.{ResolutionError, ValidationError}
 
 import loaders._
 import adapters.RawEvent
@@ -35,7 +34,7 @@ import utils.Clock._
 import utils.ConversionUtils
 import enrichments.registry.JavascriptScriptEnrichment
 
-class EnrichmentManagerSpec extends Specification with ValidatedMatchers {
+class EnrichmentManagerSpec extends Specification with EitherMatchers {
   val enrichmentReg = EnrichmentRegistry[Eval]()
   val client = SpecHelpers.client
   val processor = Processor("ssc-tests", "0.0.0")
@@ -53,7 +52,7 @@ class EnrichmentManagerSpec extends Specification with ValidatedMatchers {
   )
 
   "enrichEvent" should {
-    "emit a SchemaViolations wrapping 2 expected errors if the input event contains 2 invalid contexts" >> {
+    "return a SchemaViolations bad row if the input event contains an invalid context" >> {
       val parameters = Map(
         "e" -> "pp",
         "tv" -> "js-0.13.1",
@@ -68,10 +67,6 @@ class EnrichmentManagerSpec extends Specification with ValidatedMatchers {
                   "foo": "hello@world.com",
                   "emailAddress2": "foo@bar.org"
                 }
-              },
-              {
-                "schema":"iglu:com.snowplowanalytics.snowplow/foo/jsonschema/1-0-0",
-                "data": {}
               }
             ]
           }
@@ -85,28 +80,14 @@ class EnrichmentManagerSpec extends Specification with ValidatedMatchers {
         timestamp,
         rawEvent
       )
-      enriched.value must beInvalid.like {
-        case BadRow.SchemaViolations(
-            _,
-            Failure.SchemaViolations(
-              _,
-              NonEmptyList(
-                FailureDetails.SchemaViolation.IgluError(_, ValidationError(_)),
-                List(FailureDetails.SchemaViolation.IgluError(_, ResolutionError(_)))
-              )
-            ),
-            _
-            ) =>
-          ok
-        case BadRow.SchemaViolations(_, fs, _) =>
-          ko(
-            s"the failures [$fs] in the SchemaViolations are not one ValidationError and one ResolutionError"
-          )
-        case br => ko(s"[$br] is not one SchemaViolations")
+
+      enriched.value.value must beLeft.like {
+        case _: BadRow.SchemaViolations => ok
+        case br => ko(s"bad row [$br] is not SchemaViolations")
       }
     }
 
-    "emit a SchemaViolations wrapping 1 expected error if the input unstructured event is invalid" >> {
+    "return a SchemaViolations bad row if the input unstructured event is invalid" >> {
       val parameters = Map(
         "e" -> "ue",
         "tv" -> "js-0.13.1",
@@ -132,96 +113,13 @@ class EnrichmentManagerSpec extends Specification with ValidatedMatchers {
         timestamp,
         rawEvent
       )
-      enriched.value must beInvalid.like {
-        case BadRow.SchemaViolations(
-            _,
-            Failure.SchemaViolations(
-              _,
-              NonEmptyList(
-                FailureDetails.SchemaViolation.IgluError(_, ValidationError(_)),
-                Nil
-              )
-            ),
-            _
-            ) =>
-          ok
-        case BadRow.SchemaViolations(_, f, _) =>
-          ko(
-            s"the failure [$f] in the SchemaViolations is not one ValidationError"
-          )
-        case br => ko(s"[$br] is not one SchemaViolations")
+      enriched.value.value must beLeft.like {
+        case _: BadRow.SchemaViolations => ok
+        case br => ko(s"bad row [$br] is not SchemaViolations")
       }
     }
 
-    "emit a SchemaViolations wrapping 3 expected errors if the input event contains 2 invalid contexts and 1 invalid unstructured event" >> {
-      val parameters = Map(
-        "e" -> "ue",
-        "tv" -> "js-0.13.1",
-        "p" -> "web",
-        "co" -> """
-          {
-            "schema": "iglu:com.snowplowanalytics.snowplow/contexts/jsonschema/1-0-0",
-            "data": [
-              {
-                "schema":"iglu:com.acme/email_sent/jsonschema/1-0-0",
-                "data": {
-                  "foo": "hello@world.com",
-                  "emailAddress2": "foo@bar.org"
-                }
-              },
-              {
-                "schema":"iglu:com.snowplowanalytics.snowplow/foo/jsonschema/1-0-0",
-                "data": {}
-              }
-            ]
-          }
-        """,
-        "ue_pr" -> """
-          {
-            "schema":"iglu:com.snowplowanalytics.snowplow/unstruct_event/jsonschema/1-0-0",
-            "data":{
-              "schema":"iglu:com.acme/email_sent/jsonschema/1-0-0",
-              "data": {
-                "emailAddress": "hello@world.com",
-                "emailAddress2": "foo@bar.org",
-                "emailAddress3": "foo@bar.org"
-              }
-            }
-          }"""
-      )
-      val rawEvent = RawEvent(api, parameters, None, source, context)
-      val enriched = EnrichmentManager.enrichEvent(
-        enrichmentReg,
-        client,
-        processor,
-        timestamp,
-        rawEvent
-      )
-      enriched.value must beInvalid.like {
-        case BadRow.SchemaViolations(
-            _,
-            Failure.SchemaViolations(
-              _,
-              NonEmptyList(
-                FailureDetails.SchemaViolation.IgluError(_, ValidationError(_)),
-                List(
-                  FailureDetails.SchemaViolation.IgluError(_, ResolutionError(_)),
-                  FailureDetails.SchemaViolation.IgluError(_, ValidationError(_))
-                )
-              )
-            ),
-            _
-            ) =>
-          ok
-        case BadRow.SchemaViolations(_, fs, _) =>
-          ko(
-            s"the failures [$fs] in the SchemaViolations are not one ValidationError, one ResolutionError and one ValidationError"
-          )
-        case br => ko(s"[$br] is not one SchemaViolations")
-      }
-    }
-
-    "emit an EnrichmentFailures wrapping an expected error (Simple here) if one of the enrichment fails (JS enrichment here)" >> {
+    "return an EnrichmentFailures bad row if one of the enrichment (JS enrichment here) fails" >> {
       val script = """
         function process(event) {
           throw "Javascript exception";
@@ -257,7 +155,7 @@ class EnrichmentManagerSpec extends Specification with ValidatedMatchers {
         timestamp,
         rawEvent
       )
-      enriched.value must beInvalid.like {
+      enriched.value.value must beLeft.like {
         case BadRow.EnrichmentFailures(
             _,
             Failure.EnrichmentFailures(
@@ -273,15 +171,14 @@ class EnrichmentManagerSpec extends Specification with ValidatedMatchers {
             _
             ) =>
           ok
-        case BadRow.EnrichmentFailures(_, f, _) =>
+        case br =>
           ko(
-            s"the failure [$f] in the EnrichmentFailures is not one Simple"
+            s"bad row [$br] is not an EnrichmentFailures containing one EnrichmentFailureMessage.Simple"
           )
-        case br => ko(s"[$br] is not one EnrichmentFailures")
       }
     }
 
-    "emit an EnrichmentFailures wrapping an IgluError if one of the contexts added by the enrichments is invalid (using JS enrichment)" >> {
+    "return an EnrichmentFailures bad row containing one IgluError if one of the contexts added by the enrichments is invalid" >> {
       val script = """
         function process(event) {
           return [ { schema: "iglu:com.acme/email_sent/jsonschema/1-0-0",
@@ -321,7 +218,7 @@ class EnrichmentManagerSpec extends Specification with ValidatedMatchers {
         timestamp,
         rawEvent
       )
-      enriched.value must beInvalid.like {
+      enriched.value.value must beLeft.like {
         case BadRow.EnrichmentFailures(
             _,
             Failure.EnrichmentFailures(
@@ -329,7 +226,7 @@ class EnrichmentManagerSpec extends Specification with ValidatedMatchers {
               NonEmptyList(
                 FailureDetails.EnrichmentFailure(
                   _,
-                  FailureDetails.EnrichmentFailureMessage.IgluError(_, ValidationError(_))
+                  _: FailureDetails.EnrichmentFailureMessage.IgluError
                 ),
                 Nil
               )
@@ -337,15 +234,11 @@ class EnrichmentManagerSpec extends Specification with ValidatedMatchers {
             _
             ) =>
           ok
-        case BadRow.EnrichmentFailures(_, f, _) =>
-          ko(
-            s"the failure [$f] in the EnrichmentFailures is not one ValidationError"
-          )
-        case br => ko(s"[$br] is not one EnrichmentFailures")
+        case br => ko(s"bad row [$br] is not an EnrichmentFailures containing one IgluError")
       }
     }
 
-    "emit an EnrichedEvent if the input event contains a valid context and a valid unstructured event" >> {
+    "emit an EnrichedEvent if everything goes well" >> {
       val parameters = Map(
         "e" -> "ue",
         "tv" -> "js-0.13.1",
@@ -384,7 +277,7 @@ class EnrichmentManagerSpec extends Specification with ValidatedMatchers {
         timestamp,
         rawEvent
       )
-      enriched.value must beValid
+      enriched.value.value must beRight
     }
   }
 }
